@@ -11,7 +11,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 import { createServer as createViteServer } from "vite";
 
-dotenv.config();
+dotenv.config({ path: ".env.local" });
 
 const app = express();
 const PORT = 3000;
@@ -69,18 +69,50 @@ function getGeminiClient(): GoogleGenAI {
   return aiClient;
 }
 
-// Retry mechanism for API robustness (up to 3 retries with exponential backoff)
-async function callGeminiWithRetry<T>(fn: () => Promise<T>, retries = 3, delay = 1000): Promise<T> {
-  try {
-    return await fn();
-  } catch (error: any) {
-    if (retries > 0) {
-      console.warn(`Gemini call failed. Retrying in ${delay}ms... (Remaining retries: ${retries}). Error:`, error.message || error);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      return await callGeminiWithRetry(fn, retries - 1, delay * 2);
+// Retry mechanism for API robustness with automatic model fallbacks (optimized for fast failover)
+async function callGeminiWithRetry<T>(
+  fn: (model: string) => Promise<T>,
+  retries = 1,
+  delay = 200,
+  models = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-1.5-flash-8b",
+    "gemini-flash-latest"
+  ]
+): Promise<T> {
+  let lastError: any = null;
+  for (const model of models) {
+    let currentRetries = retries;
+    let currentDelay = delay;
+    while (currentRetries >= 0) {
+      try {
+        return await fn(model);
+      } catch (error: any) {
+        lastError = error;
+        const msg = error.message || String(error);
+        const isQuotaExceeded = msg.includes("429") || msg.includes("Resource has been exhausted") || msg.includes("quota") || msg.includes("Quota exceeded");
+        const isTransient = msg.includes("503") || msg.includes("service unavailable") || msg.includes("UNAVAILABLE") || msg.includes("high demand");
+        
+        if (isQuotaExceeded) {
+          console.warn(`Gemini model ${model} hit quota limit. Falling back to the next model immediately. Error:`, msg);
+          break; // Try the next fallback model immediately without waiting/retrying on this model
+        } else if (isTransient && currentRetries > 0) {
+          console.warn(`Gemini call for model ${model} failed with transient network error. Retrying in ${currentDelay}ms... (Remaining retries: ${currentRetries}). Error:`, msg);
+          await new Promise((resolve) => setTimeout(resolve, currentDelay));
+          currentRetries--;
+          currentDelay *= 1.5;
+        } else {
+          console.warn(`Gemini model ${model} failed. Falling back if another model is available. Error:`, msg);
+          break; // Try the next fallback model immediately
+        }
+      }
     }
-    throw error;
   }
+  throw lastError || new Error("All Gemini models failed.");
 }
 
 // Friendly error mapper for clinical app safety
@@ -292,9 +324,9 @@ app.post("/api/analyze", async (req, res) => {
 
     console.log("Calling Gemini for analysis and structured parsing...");
     const ai = getGeminiClient();
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
       ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents,
         config: {
           responseMimeType: "application/json",
@@ -340,6 +372,7 @@ app.post("/api/translate", async (req, res) => {
          - Exact measurement metrics, chemical formula details, or dosages (keep mg, ml, g, capsules, tablets, pills exactly as written).
          - Boolean flags ('timing.morning', 'timing.afternoon', 'timing.night' must remain boolean).
       3. The translated fields must remain clear, natural, and highly compassionate for patients while preserving exact medical warnings.
+      4. You MUST use the correct, native script of the target language. For example, use Kannada script (ಕನ್ನಡ) for Kannada, Telugu script (తెలుగు) for Telugu, Hindi script (Devanagari) for Hindi, Tamil script (தமிழ்) for Tamil, etc. NEVER use the script of one language to write words of another language.
       
       Original Data to translate:
       ${JSON.stringify(medicineAnalysis, null, 2)}
@@ -383,9 +416,9 @@ app.post("/api/translate", async (req, res) => {
       ],
     };
 
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
       ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents: { parts: [{ text: translationPrompt }] },
         config: {
           responseMimeType: "application/json",
@@ -423,9 +456,9 @@ app.post("/api/manual-translate", async (req, res) => {
     ${text}`;
 
     console.log(`Translating manual input into ${targetLanguage}...`);
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
        ai.models.generateContent({
-         model: "gemini-3.5-flash",
+         model,
          contents: { parts: [{ text: prompt }] },
          config: {
            systemInstruction: "You are a highly precise medical and scientific translator. Translate user messages accurately.",
@@ -473,9 +506,9 @@ app.post("/api/medicine-search", async (req, res) => {
     console.log(`Searching and analyzing medicine info for: ${medicineName}`);
 
     // Call Gemini with exactly 1 retry on failure to optimize performance and prevent timeout
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
       ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents: { parts: [{ text: searchPrompt }] },
         config: {
           responseMimeType: "application/json",
@@ -527,6 +560,7 @@ app.post("/api/translate-medicine", async (req, res) => {
          - Exact measurement metrics, dosages, or scientific units (keep 'mg', 'ml', 'g', 'capsules', 'tablets', 'pills', etc. exactly as written).
          - Common clinical abbreviations.
       3. The 'found' status flag must remain a boolean equal to ${medicineInfo.found}.
+      4. You MUST use the correct, native script of the target language. For example, use Kannada script (ಕನ್ನಡ) for Kannada, Telugu script (తెలుగు) for Telugu, Hindi script (Devanagari) for Hindi, Tamil script (தமிழ்) for Tamil, etc. NEVER use the script of one language to write words of another language.
 
       Original Medicine Information to translate:
       ${JSON.stringify(medicineInfo, null, 2)}
@@ -535,9 +569,9 @@ app.post("/api/translate-medicine", async (req, res) => {
     console.log(`Translating medicine search results into: ${targetLanguage}`);
 
     // Call Gemini with exactly 1 retry to optimize performance
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
       ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents: { parts: [{ text: translationPrompt }] },
         config: {
           responseMimeType: "application/json",
@@ -587,6 +621,7 @@ app.post("/api/translate-ui", async (req, res) => {
       2. Translate only the values.
       3. The translated UI text must be natural, professional, and clear for a medical application context.
       4. Return ONLY a valid JSON object.
+      5. You MUST use the correct, native script of the target language. For example, use Kannada script (ಕನ್ನಡ) for Kannada, Telugu script (తెలుగు) for Telugu, Hindi script (Devanagari) for Hindi, Tamil script (தமிழ்) for Tamil, etc. NEVER use the script of one language to write words of another language.
       
       JSON to translate:
       ${JSON.stringify(dictionary, null, 2)}
@@ -594,9 +629,9 @@ app.post("/api/translate-ui", async (req, res) => {
 
     console.log(`Translating UI dictionary into: ${targetLanguage}`);
 
-    const response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry((model) =>
       ai.models.generateContent({
-        model: "gemini-3.5-flash",
+        model,
         contents: { parts: [{ text: translationPrompt }] },
         config: {
           responseMimeType: "application/json",
@@ -657,48 +692,18 @@ CRITICAL DIRECTIVES:
    - Include a concise, humble medical disclaimer at the end of every helpful medical response (e.g., "Disclaimer: I am an AI Health Assistant, not a doctor. Please consult a qualified healthcare provider for personal medical advice.").
    - Keep responses professional, highly scannable, and clean using clear markdown formatting (bullet points, bold text).`;
 
-    let response;
-    try {
-      response = await callGeminiWithRetry(() =>
+    const response = await callGeminiWithRetry(
+      (model) =>
         ai.models.generateContent({
-          model: "gemini-3.5-flash",
+          model,
           contents: mappedContents,
           config: {
             systemInstruction,
           },
         }),
-        1,
-        500
-      );
-    } catch (e: any) {
-      console.warn("Primary model gemini-3.5-flash failed, attempting fallback to gemini-flash-latest:", e.message || e);
-      try {
-        response = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-flash-latest",
-            contents: mappedContents,
-            config: {
-              systemInstruction,
-            },
-          }),
-          1,
-          500
-        );
-      } catch (e2: any) {
-        console.warn("Fallback to gemini-flash-latest failed, attempting fallback to gemini-3.1-flash-lite:", e2.message || e2);
-        response = await callGeminiWithRetry(() =>
-          ai.models.generateContent({
-            model: "gemini-3.1-flash-lite",
-            contents: mappedContents,
-            config: {
-              systemInstruction,
-            },
-          }),
-          1,
-          500
-        );
-      }
-    }
+      1,
+      500
+    );
 
     const reply = response.text || "I'm designed to answer healthcare and medical questions only.";
     res.json({ reply });
